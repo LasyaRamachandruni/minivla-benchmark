@@ -179,6 +179,11 @@ def ray_bench(model, model_path, workers, num_requests, prompt, scaling_test, re
         print_results_table(bench_results)
         save_results_csv(bench_results, results_output)
 
+        # Generate scaling curve
+        from pipeline.visualize import plot_scaling_curve
+        plot_scaling_curve(scaling_results, worker_counts,
+                          output_path="results/scaling_curve.png")
+
     else:
         click.echo(f"Running distributed benchmark: {workers} workers, {num_requests} requests")
         result = run_distributed_benchmark(
@@ -292,6 +297,63 @@ def _generate_plots(headers, rows, output_path):
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
+
+
+@cli.command("pipeline-bench")
+@click.option("--model", default="mock", help="Model name.")
+@click.option("--N", "num_requests", default=100, type=int, help="Number of requests.")
+@click.option("--prompt", default="pick up the red block", help="Text prompt.")
+def pipeline_bench(model, num_requests, prompt):
+    """Benchmark pipeline-parallel VLA inference (vision -> language -> action actors)."""
+    from ray_workers.pipeline_actors import run_pipeline_benchmark
+    from pipeline.visualize import plot_pipeline_breakdown
+
+    result = run_pipeline_benchmark(
+        model_name=model,
+        num_requests=num_requests,
+        prompt=prompt,
+    )
+
+    click.echo(f"\nPipeline Benchmark Results:")
+    click.echo(f"  End-to-end p50: {result['e2e_p50_ms']:.2f} ms")
+    click.echo(f"  End-to-end p95: {result['e2e_p95_ms']:.2f} ms")
+    click.echo(f"  Throughput: {result['throughput_qps']:.2f} QPS")
+
+    click.echo(f"\n  Stage Breakdown:")
+    for stage, stats in result["stage_stats"].items():
+        click.echo(f"    {stage:20s}  avg={stats['avg_ms']:.2f}ms  "
+                    f"p50={stats['p50_ms']:.2f}ms  "
+                    f"({stats['pct_of_e2e']:.1f}% of e2e)")
+
+    plot_pipeline_breakdown(result)
+
+
+@cli.command("serve")
+@click.option("--model", default="mock", help="Model name.")
+@click.option("--port", default=8000, type=int, help="HTTP port.")
+@click.option("--replicas", default=1, type=int, help="Number of serve replicas.")
+def serve(model, port, replicas):
+    """Start a Ray Serve HTTP endpoint for VLA inference."""
+    from ray_workers.serve_endpoint import run_serve
+    run_serve(model_name=model, port=port, num_replicas=replicas)
+
+
+@cli.command("batch")
+@click.option("--model", default="mock", help="Model name.")
+@click.option("--image-dir", default=None, help="Directory of images (or synthetic if omitted).")
+@click.option("--N", "num_images", default=50, type=int, help="Number of synthetic images.")
+@click.option("--prompt", default="pick up the red block", help="Text prompt.")
+@click.option("--batch-size", default=1, type=int, help="Batch size for Ray Data.")
+def batch(model, image_dir, num_images, prompt, batch_size):
+    """Run batch inference over images using Ray Data."""
+    from ray_workers.batch_inference import run_batch_inference
+    run_batch_inference(
+        model_name=model,
+        image_dir=image_dir,
+        num_synthetic=num_images,
+        prompt=prompt,
+        batch_size=batch_size,
+    )
 
 
 if __name__ == "__main__":

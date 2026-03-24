@@ -99,16 +99,22 @@ def run_benchmark(
     mem_before = measure_memory_usage()
 
     # Warmup
-    print(f"  Warming up ({warmup_runs} runs)...")
-    for _ in range(warmup_runs):
+    from tqdm import tqdm
+    for _ in tqdm(range(warmup_runs), desc="  Warmup", leave=False):
         run_inference(model_info, inputs)
 
     # Timed runs
-    print(f"  Benchmarking ({num_runs} runs)...")
     latencies = []
-    for i in range(num_runs):
+    sample_output = None
+    for i in tqdm(range(num_runs), desc="  Benchmark"):
         result = run_inference(model_info, inputs)
         latencies.append(result["latency_ms"])
+        if sample_output is None:
+            sample_output = result
+
+    # Show sample output for real VLMs
+    if sample_output and "text" in sample_output:
+        print(f'  Sample output: "{sample_output["text"][:120]}"')
 
     mem_after = measure_memory_usage()
     gpu_mem = measure_gpu_memory()
