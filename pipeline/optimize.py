@@ -1,5 +1,6 @@
 """Optimization pipeline: ONNX export, quantization, pruning."""
 
+import inspect
 import os
 import copy
 from typing import Optional
@@ -46,12 +47,17 @@ def export_to_onnx(model_info: ModelInfo, output_path: str,
         output_names=["actions", "logits"],
         dynamic_axes={
             "pixel_values": {0: "batch_size"},
-            "input_ids": {0: "batch_size", 1: "seq_len"},
+            # Sequence length is fixed at max_seq_len: tracing the attention layers bakes
+            # it into reshape ops. The processor always pads to this length.
+            "input_ids": {0: "batch_size"},
             "actions": {0: "batch_size"},
-            "logits": {0: "batch_size", 1: "seq_len"},
+            "logits": {0: "batch_size"},
         },
         opset_version=17,
         do_constant_folding=True,
+        # PyTorch 2.9+ defaults to a new exporter that needs `onnxscript` and treats
+        # dynamic_axes differently; keep the classic exporter this code was written for.
+        **({"dynamo": False} if "dynamo" in inspect.signature(torch.onnx.export).parameters else {}),
     )
 
     # Move model back to original device
