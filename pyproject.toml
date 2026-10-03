@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "minivla-benchmark"
@@ -27,3 +27,9 @@ dependencies = [
 
 [project.scripts]
 minivla = "cli:cli"
+
+[tool.setuptools]
+py-modules = ["cli"]
+
+[tool.setuptools.packages.find]
+include = ["models*", "pipeline*", "ray_workers*"]
