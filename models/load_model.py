@@ -4,6 +4,7 @@ Supports loading vision-language models from HuggingFace Transformers,
 ONNX Runtime models, and a lightweight mock model for testing.
 """
 
+import zlib
 import os
 import time
 from dataclasses import dataclass
@@ -145,8 +146,9 @@ class MockProcessor:
                 text = [text]
             ids = []
             for t in text:
-                # Simple hash-based tokenization
-                tokens = [hash(w) % self.vocab_size for w in t.split()]
+                # Simple hash-based tokenization. crc32 is stable across runs, unlike
+                # Python's hash(), which is randomized per process.
+                tokens = [zlib.crc32(w.encode()) % self.vocab_size for w in t.split()]
                 tokens = tokens[:self.max_length]
                 tokens += [0] * (self.max_length - len(tokens))
                 ids.append(tokens)
