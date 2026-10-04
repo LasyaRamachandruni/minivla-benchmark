@@ -89,6 +89,15 @@ class MockVLMModel(torch.nn.Module):
             d_model=embed_dim, nhead=num_heads, dim_feedforward=embed_dim * 4, batch_first=True,
         )
         self.decoder = torch.nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        # TransformerDecoder deep-copies one layer, so every layer starts with identical
+        # weights. Re-initialize each one so the mock behaves like a real (trained) model;
+        # otherwise ONNX export shares the weights between layers and INT8 quantization
+        # can only convert one copy.
+        for module in self.decoder.modules():
+            if module is not self.decoder and hasattr(module, "reset_parameters"):
+                module.reset_parameters()
+            elif hasattr(module, "_reset_parameters"):
+                module._reset_parameters()
 
         # Action head: predicts 7-DoF action (x, y, z, roll, pitch, yaw, gripper)
         self.action_head = torch.nn.Linear(embed_dim, 7)
