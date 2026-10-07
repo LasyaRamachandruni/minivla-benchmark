@@ -1,157 +1,97 @@
-"""Accuracy evaluation for VLA models.
+"""Action-prediction metrics.
 
-Compares model outputs across optimization configurations to measure
-accuracy degradation from quantization and pruning.
+Two different questions, kept apart on purpose:
+
+* **Error vs ground truth** (`action_errors`): how far the predicted action chunk is from the
+  actions the LIBERO demonstrator took (MSE / L1, overall and per action dimension). Only
+  meaningful for a checkpoint trained on LIBERO's action space.
+* **Agreement with the FP32 model** (`agreement`): how far an optimized variant's actions are
+  from the FP32 baseline's actions on the same frames with the same flow-matching noise
+  (relative L2 error, MSE, L1). This isolates what the optimization changed and works for any
+  checkpoint, including ones not trained on LIBERO.
+
+`noise floor`: SmolVLA samples actions from noise, so FP32 itself gives different actions for a
+different noise seed. The suite reports FP32-vs-FP32-with-other-noise agreement as a reference;
+an optimization whose disagreement is below that floor changes outputs less than resampling does.
 """
 
+from typing import Optional
+
 import numpy as np
-import torch
-from typing import List, Optional, Tuple
-
-from PIL import Image
-
-from models.load_model import ModelInfo, create_sample_input
-from pipeline.infer import run_inference
 
 
-def generate_eval_dataset(
-    processor,
-    device: str,
-    num_samples: int = 50,
-    seed: int = 42,
-) -> List[dict]:
-    """Generate a synthetic evaluation dataset.
+def _err_block(diff: np.ndarray, mask: Optional[np.ndarray] = None) -> dict:
+    """diff: (..., A). mask: same leading shape as diff[..., 0], True = valid."""
+    a = diff.shape[-1]
+    flat = diff.reshape(-1, a)
+    if mask is not None:
+        flat = flat[mask.reshape(-1)]
+    if len(flat) == 0:
+        return {"mse": float("nan"), "l1": float("nan"), "per_dim_mse": [float("nan")] * a,
+                "per_dim_l1": [float("nan")] * a, "count": 0}
+    return {
+        "mse": float(np.mean(flat ** 2)),
+        "l1": float(np.mean(np.abs(flat))),
+        "per_dim_mse": np.mean(flat ** 2, axis=0).tolist(),
+        "per_dim_l1": np.mean(np.abs(flat), axis=0).tolist(),
+        "count": int(len(flat)),
+    }
 
-    Creates deterministic random image+prompt pairs for consistent
-    comparison across model configurations.
+
+def action_errors(pred: np.ndarray, gt: np.ndarray, gt_is_pad: Optional[np.ndarray] = None,
+                  horizon: Optional[int] = None) -> dict:
+    """Error of predicted chunks (N, chunk, A) against ground truth (N, H, A).
+
+    `next_action` scores only the first predicted action against the action recorded at that
+    frame; `chunk` scores the first `h = min(chunk, H, horizon)` steps, ignoring steps past the
+    end of the episode.
     """
-    rng = np.random.RandomState(seed)
-    prompts = [
-        "pick up the red block",
-        "move the cup to the left",
-        "push the button",
-        "grasp the yellow ball",
-        "place the object on the shelf",
-        "open the drawer",
-        "close the gripper",
-        "rotate the handle clockwise",
-        "slide the box forward",
-        "lift the plate carefully",
-    ]
-
-    dataset = []
-    for i in range(num_samples):
-        img_arr = rng.randint(0, 255, (224, 224, 3), dtype=np.uint8)
-        image = Image.fromarray(img_arr)
-        prompt = prompts[i % len(prompts)]
-        inputs = create_sample_input(processor, device, image, prompt)
-        dataset.append(inputs)
-
-    return dataset
+    pred = np.asarray(pred, dtype=np.float64)
+    gt = np.asarray(gt, dtype=np.float64)
+    if pred.shape[-1] != gt.shape[-1]:
+        raise ValueError(f"action dims differ: prediction {pred.shape[-1]} vs ground truth {gt.shape[-1]}")
+    if gt_is_pad is None:
+        gt_is_pad = np.zeros(gt.shape[:2], dtype=bool)
+    h = min(pred.shape[1], gt.shape[1], horizon or gt.shape[1])
+    return {
+        "n_frames": int(len(pred)),
+        "horizon": int(h),
+        "next_action": _err_block(pred[:, 0] - gt[:, 0]),
+        "chunk": _err_block(pred[:, :h] - gt[:, :h], ~gt_is_pad[:, :h]),
+    }
 
 
-def compute_action_accuracy(
-    baseline_actions: np.ndarray,
-    test_actions: np.ndarray,
-    tolerance: float = 0.1,
-) -> float:
-    """Compute accuracy as percentage of action dimensions within tolerance."""
-    if baseline_actions.shape != test_actions.shape:
-        min_len = min(len(baseline_actions), len(test_actions))
-        baseline_actions = baseline_actions[:min_len]
-        test_actions = test_actions[:min_len]
-
-    diffs = np.abs(baseline_actions - test_actions)
-    within_tolerance = diffs < tolerance
-    return float(np.mean(within_tolerance) * 100)
-
-
-def compute_logit_accuracy(
-    baseline_logits: np.ndarray,
-    test_logits: np.ndarray,
-) -> float:
-    """Compute top-1 agreement between baseline and test logits."""
-    baseline_preds = np.argmax(baseline_logits, axis=-1).flatten()
-    test_preds = np.argmax(test_logits, axis=-1).flatten()
-
-    min_len = min(len(baseline_preds), len(test_preds))
-    agreement = np.mean(baseline_preds[:min_len] == test_preds[:min_len])
-    return float(agreement * 100)
+def agreement(pred: np.ndarray, ref: np.ndarray, horizon: Optional[int] = None) -> dict:
+    """How closely `pred` matches `ref` (both (N, chunk, A)) over the first `horizon` steps."""
+    pred = np.asarray(pred, dtype=np.float64)
+    ref = np.asarray(ref, dtype=np.float64)
+    if pred.shape != ref.shape:
+        raise ValueError(f"shape mismatch {pred.shape} vs {ref.shape}")
+    h = min(pred.shape[1], horizon or pred.shape[1])
+    d = pred[:, :h] - ref[:, :h]
+    num = np.sqrt((d ** 2).sum(axis=(1, 2)))
+    den = np.sqrt((ref[:, :h] ** 2).sum(axis=(1, 2)))
+    rel = num / np.maximum(den, 1e-12)
+    block = _err_block(d)
+    return {
+        "n_frames": int(len(pred)),
+        "horizon": int(h),
+        "rel_l2_mean": float(rel.mean()),
+        "rel_l2_median": float(np.median(rel)),
+        "rel_l2_p95": float(np.percentile(rel, 95)),
+        "mse": block["mse"],
+        "l1": block["l1"],
+        "max_abs": float(np.abs(d).max()),
+        "per_dim_mse": block["per_dim_mse"],
+    }
 
 
-def compute_token_accuracy(
-    baseline_ids: np.ndarray,
-    test_ids: np.ndarray,
-) -> float:
-    """Compute token-level agreement between generated token sequences.
-
-    Uses a combination of exact positional match and token overlap (Jaccard).
-    This is more forgiving than strict positional matching, since optimized
-    models may produce semantically similar but slightly shifted outputs.
-    """
-    if len(baseline_ids) == 0 and len(test_ids) == 0:
-        return 100.0
-
-    # Positional agreement (where tokens overlap in position)
-    min_len = min(len(baseline_ids), len(test_ids))
-    if min_len > 0:
-        positional = np.mean(baseline_ids[:min_len] == test_ids[:min_len])
-    else:
-        positional = 0.0
-
-    # Jaccard overlap (set similarity regardless of position)
-    base_set = set(baseline_ids.tolist()) if len(baseline_ids) > 0 else set()
-    test_set = set(test_ids.tolist()) if len(test_ids) > 0 else set()
-    union = base_set | test_set
-    jaccard = len(base_set & test_set) / len(union) if union else 1.0
-
-    # Weighted: 60% positional, 40% overlap
-    combined = 0.6 * positional + 0.4 * jaccard
-    return float(combined * 100)
-
-
-@torch.no_grad()
-def evaluate_model(
-    model_info: ModelInfo,
-    dataset: List[dict],
-    baseline_outputs: Optional[List[dict]] = None,
-) -> Tuple[float, List[dict]]:
-    """Evaluate a model on the synthetic dataset.
-
-    Args:
-        model_info: Model to evaluate.
-        dataset: List of input dicts.
-        baseline_outputs: If provided, compute accuracy relative to baseline.
-
-    Returns:
-        (accuracy_pct, list_of_outputs)
-    """
-    outputs = []
-    for inputs in dataset:
-        # Move inputs to the model's device (quantized models may be on CPU
-        # while dataset was created on MPS/CUDA)
-        device_inputs = {
-            k: v.to(model_info.device) if isinstance(v, torch.Tensor) else v
-            for k, v in inputs.items()
-        }
-        result = run_inference(model_info, device_inputs)
-        outputs.append(result)
-
-    if baseline_outputs is None:
-        return 100.0, outputs
-
-    # Compare against baseline
-    accuracies = []
-    for base_out, test_out in zip(baseline_outputs, outputs):
-        if "actions" in base_out and "actions" in test_out:
-            acc = compute_action_accuracy(base_out["actions"], test_out["actions"])
-            accuracies.append(acc)
-        elif "generated_ids" in base_out and "generated_ids" in test_out:
-            acc = compute_token_accuracy(base_out["generated_ids"], test_out["generated_ids"])
-            accuracies.append(acc)
-        elif "logits" in base_out and "logits" in test_out:
-            acc = compute_logit_accuracy(base_out["logits"], test_out["logits"])
-            accuracies.append(acc)
-
-    accuracy = float(np.mean(accuracies)) if accuracies else 100.0
-    return accuracy, outputs
+def degradation(metrics: dict, baseline: dict) -> dict:
+    """Change in ground-truth error relative to the FP32 baseline (positive = worse)."""
+    out = {}
+    for part in ("next_action", "chunk"):
+        for m in ("mse", "l1"):
+            v, b = metrics[part][m], baseline[part][m]
+            out[f"{part}_{m}_delta"] = v - b
+            out[f"{part}_{m}_delta_pct"] = (v - b) / b * 100.0 if b else float("nan")
+    return out
