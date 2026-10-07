@@ -6,7 +6,8 @@ on:
   pull_request:
 
 jobs:
-  test:
+  unit:
+    # Mock model only: no LeRobot, no Ray, no downloads.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,9 +16,28 @@ jobs:
           python-version: "3.11"
           cache: pip
       - name: Install CPU-only PyTorch
-        run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: Install test dependencies
-        # Ray and Transformers are not needed: the tests use the built-in mock model.
-        run: pip install onnx onnxruntime numpy psutil Pillow tabulate click tqdm pytest
+        run: pip install numpy Pillow psutil matplotlib click pytest
       - name: Run tests
         run: pytest -q
+
+  lerobot-integration:
+    # Runs LeRobot's real SmolVLA and dataset code on tiny local fixtures (still no Hub downloads).
+    # Not yet confirmed on GitHub-hosted runners, so it does not block the build.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install CPU-only PyTorch (LeRobot 0.6.1 needs torch < 2.12)
+        run: pip install "torch<2.12" "torchvision<0.27" --index-url https://download.pytorch.org/whl/cpu
+      - name: Install LeRobot
+        run: pip install "lerobot[smolvla,dataset]==0.6.1" psutil matplotlib click pytest
+      - name: Run integration tests
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: pytest -q -m integration
