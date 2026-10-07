@@ -1,91 +1,62 @@
-"""Ray actor wrapping the VLA inference pipeline."""
+"""A Ray actor that runs real, batched VLA inference.
+
+The worker logic is a plain class (`VLAWorker`) so it can be unit-tested without Ray;
+`remote_worker()` wraps it with `ray.remote` at runtime. Workers only ever return actions
+computed by the model from the frames they were given - there is no fallback output.
+"""
 
 import time
-from typing import Optional
+from typing import List, Optional, Sequence
 
 import numpy as np
-import ray
-import torch
-from PIL import Image
 
 
-@ray.remote
-class VLAInferenceActor:
-    """Ray actor that encapsulates a VLA model for distributed inference.
+class VLAWorker:
+    def __init__(self, model_name: str = "mock", device: str = "cpu", variant: str = "fp32",
+                 prune_amount: float = 0.2, num_threads: Optional[int] = None):
+        import torch
 
-    Each actor loads its own copy of the model, enabling horizontal
-    scaling across multiple workers (CPUs/GPUs).
-    """
+        from models.load_model import load_model
+        from pipeline.optimize import build_variant
 
-    def __init__(self, model_name: str = "mock", model_path: Optional[str] = None,
-                 device: Optional[str] = None):
-        """Initialize the actor with a loaded model.
+        if num_threads:
+            torch.set_num_threads(num_threads)
+        base = load_model(model_name, device=device)
+        self.model, _ = build_variant(base, variant, prune_amount)
+        self.variant = variant
+        self.frames_done = 0
+        self.busy_ms = 0.0
+        self.batches = 0
 
-        Args:
-            model_name: Model name to load ('mock', 'mobilevlm', etc.)
-            model_path: Path to ONNX model file (overrides model_name).
-            device: Target device. Auto-detected if None.
-        """
-        # Import here to avoid serialization issues
-        from models.load_model import load_model, load_onnx_model
+    def infer_batch(self, frame_dicts: List[dict], seeds: Sequence[int]) -> dict:
+        from models.frames import Frame
 
-        if model_path and model_path.endswith(".onnx"):
-            self.model_info = load_onnx_model(model_path)
-        else:
-            self.model_info = load_model(model_name, device=device or "cpu")
+        if not frame_dicts:
+            raise ValueError("empty batch")
+        frames = [Frame.from_dict(d) for d in frame_dicts]
+        t0 = time.perf_counter()
+        actions = self.model.predict(frames, seeds, batch_size=len(frames))
+        ms = (time.perf_counter() - t0) * 1000
+        if not np.isfinite(actions).all():
+            raise FloatingPointError("model produced non-finite actions")
+        self.frames_done += len(frames)
+        self.busy_ms += ms
+        self.batches += 1
+        return {"actions": actions, "latency_ms": ms, "batch_size": len(frames)}
 
-        self.request_count = 0
-        self.total_latency_ms = 0.0
+    def stats(self) -> dict:
+        return {"variant": self.variant, "frames": self.frames_done, "batches": self.batches,
+                "busy_ms": self.busy_ms,
+                "avg_batch_ms": self.busy_ms / self.batches if self.batches else 0.0}
 
-    def infer(self, image_bytes: Optional[bytes] = None,
-              prompt: str = "pick up the red block") -> dict:
-        """Run inference on a single image+prompt pair.
+    def reset_stats(self) -> None:
+        self.frames_done, self.busy_ms, self.batches = 0, 0.0, 0
 
-        Args:
-            image_bytes: JPEG/PNG bytes, or None for random input.
-            prompt: Text instruction.
-
-        Returns:
-            Dict with 'latency_ms', 'actions', 'worker_id'.
-        """
-        from models.load_model import create_sample_input
-        from pipeline.infer import run_inference
-
-        image = None
-        if image_bytes:
-            import io
-            image = Image.open(io.BytesIO(image_bytes))
-
-        inputs = create_sample_input(
-            self.model_info.processor, self.model_info.device, image, prompt
-        )
-        result = run_inference(self.model_info, inputs)
-
-        self.request_count += 1
-        self.total_latency_ms += result["latency_ms"]
-
-        # Serialize numpy arrays for Ray transport
-        if "actions" in result:
-            result["actions"] = result["actions"].tolist()
-        if "generated_ids" in result:
-            result["generated_ids"] = result["generated_ids"].tolist()
-        if "logits" in result:
-            del result["logits"]  # Too large to send back
-
-        result["worker_id"] = ray.get_runtime_context().get_actor_id()
-        return result
-
-    def get_stats(self) -> dict:
-        """Return worker utilization statistics."""
-        return {
-            "worker_id": ray.get_runtime_context().get_actor_id(),
-            "request_count": self.request_count,
-            "total_latency_ms": self.total_latency_ms,
-            "avg_latency_ms": (
-                self.total_latency_ms / self.request_count
-                if self.request_count > 0 else 0
-            ),
-        }
-
-    def health_check(self) -> bool:
+    def ready(self) -> bool:
         return True
+
+
+def remote_worker(num_cpus: float = 1, num_gpus: float = 0):
+    import ray
+
+    return ray.remote(num_cpus=num_cpus, num_gpus=num_gpus)(VLAWorker)

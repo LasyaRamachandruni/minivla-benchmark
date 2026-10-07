@@ -1,143 +1,87 @@
-"""Distributed benchmarking with Ray workers."""
+"""Data-parallel inference across Ray actors.
+
+The eval frames are split into fixed-size batches and dispatched to `num_workers` actors, each
+holding its own copy of the model. Every action returned is a real model output; the driver
+checks that all frames came back with finite actions.
+
+On a single machine all workers share the same CPU cores (or GPU), so throughput cannot scale
+past the hardware; the result records `cpu_count` so the scaling curve can be read honestly.
+"""
 
 import os
-import sys
 import time
-from typing import List, Optional
+from typing import List, Sequence, Tuple
 
 import numpy as np
 
-# Add project root to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from models.frames import Frame
+from pipeline.benchmark import latency_stats
 
 
-def run_distributed_benchmark(
-    model_name: str = "mock",
-    model_path: Optional[str] = None,
-    num_workers: int = 4,
-    num_requests: int = 200,
-    prompt: str = "pick up the red block",
-) -> dict:
-    """Run distributed inference benchmark across Ray workers.
+def make_batches(frames: Sequence[Frame], batch_size: int, noise_seed: int = 0) -> List[Tuple[list, list]]:
+    from pipeline.suite import frame_seeds
 
-    Spawns `num_workers` Ray actors, distributes `num_requests` across them,
-    and measures throughput and latency scaling.
+    seeds = frame_seeds(len(frames), noise_seed)
+    out = []
+    for i in range(0, len(frames), batch_size):
+        out.append(([f.to_dict() for f in frames[i:i + batch_size]], seeds[i:i + batch_size]))
+    return out
 
-    Args:
-        model_name: Model to load on each worker.
-        model_path: Path to ONNX model (optional).
-        num_workers: Number of parallel Ray actors.
-        num_requests: Total number of inference requests.
-        prompt: Text prompt for all requests.
 
-    Returns:
-        Dict with benchmark results and per-worker stats.
-    """
+def run_distributed_benchmark(model_name: str, frames: Sequence[Frame], num_workers: int = 2, batch_size: int = 4,
+                              variant: str = "fp32", device: str = "cpu", prune_amount: float = 0.2) -> dict:
     import ray
-    from ray_workers.actor import VLAInferenceActor
 
-    if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True, log_to_driver=False)
+    from ray_workers import init_ray
+    from ray_workers.actor import remote_worker
 
-    print(f"Spawning {num_workers} Ray workers...")
-    workers = [
-        VLAInferenceActor.remote(model_name=model_name, model_path=model_path)
-        for _ in range(num_workers)
-    ]
+    init_ray(log_to_driver=False)
 
-    # Wait for all workers to be ready
-    ready_checks = [w.health_check.remote() for w in workers]
-    ray.get(ready_checks)
-    print(f"All {num_workers} workers ready.")
+    cpus = os.cpu_count() or 1
+    threads = max(1, cpus // num_workers)
+    gpu = device.startswith("cuda")
+    # fractional reservations so any worker count can be scheduled on a small machine
+    Worker = remote_worker(num_cpus=min(1.0, cpus / num_workers), num_gpus=(1.0 / num_workers) if gpu else 0)
+    workers = [Worker.remote(model_name, device, variant, prune_amount, threads) for _ in range(num_workers)]
+    ray.get([w.ready.remote() for w in workers])
 
-    # Distribute requests round-robin
-    print(f"Sending {num_requests} requests across {num_workers} workers...")
-    pending_refs = []
-    wall_start = time.perf_counter()
+    batches = make_batches(frames, batch_size)
+    ray.get([w.infer_batch.remote(*batches[0]) for w in workers])  # warm every worker once
+    ray.get([w.reset_stats.remote() for w in workers])
 
-    for i in range(num_requests):
-        worker = workers[i % num_workers]
-        ref = worker.infer.remote(image_bytes=None, prompt=prompt)
-        pending_refs.append(ref)
+    t0 = time.perf_counter()
+    refs = [workers[i % num_workers].infer_batch.remote(fd, s) for i, (fd, s) in enumerate(batches)]
+    outs = ray.get(refs)
+    wall = time.perf_counter() - t0
 
-    # Collect all results
-    results = ray.get(pending_refs)
-    wall_elapsed = time.perf_counter() - wall_start
-
-    # Analyze results
-    latencies = np.array([r["latency_ms"] for r in results])
-    wall_throughput = num_requests / wall_elapsed
-
-    # Per-worker stats
-    worker_stats = ray.get([w.get_stats.remote() for w in workers])
-
-    # Cleanup
+    actions = np.concatenate([o["actions"] for o in outs])
+    if len(actions) != len(frames):
+        raise RuntimeError(f"expected {len(frames)} action chunks, got {len(actions)}")
+    stats = ray.get([w.stats.remote() for w in workers])
     for w in workers:
         ray.kill(w)
 
-    summary = {
+    return {
+        "model": model_name,
+        "variant": variant,
+        "device": device,
         "num_workers": num_workers,
-        "num_requests": num_requests,
-        "wall_time_sec": wall_elapsed,
-        "p50_latency_ms": float(np.percentile(latencies, 50)),
-        "p95_latency_ms": float(np.percentile(latencies, 95)),
-        "p99_latency_ms": float(np.percentile(latencies, 99)),
-        "mean_latency_ms": float(np.mean(latencies)),
-        "throughput_qps": wall_throughput,
-        "worker_stats": worker_stats,
+        "torch_threads_per_worker": threads,
+        "cpu_count": cpus,
+        "batch_size": batch_size,
+        "num_frames": len(frames),
+        "wall_time_s": wall,
+        "throughput_frames_per_s": len(frames) / wall,
+        "batch_latency": latency_stats(np.array([o["latency_ms"] for o in outs]), batch_size=batch_size),
+        "worker_stats": stats,
+        "actions_shape": list(actions.shape),
     }
 
-    return summary
 
-
-def compare_scaling(
-    model_name: str = "mock",
-    model_path: Optional[str] = None,
-    worker_counts: List[int] = None,
-    num_requests: int = 200,
-) -> List[dict]:
-    """Compare throughput across different worker counts.
-
-    Args:
-        model_name: Model to benchmark.
-        model_path: Optional ONNX model path.
-        worker_counts: List of worker counts to test.
-        num_requests: Requests per configuration.
-
-    Returns:
-        List of benchmark results, one per worker count.
-    """
-    if worker_counts is None:
-        worker_counts = [1, 2, 4]
-
-    all_results = []
-
+def compare_scaling(model_name: str, frames: Sequence[Frame], worker_counts: Sequence[int], batch_size: int = 4,
+                    variant: str = "fp32", device: str = "cpu") -> List[dict]:
+    results = []
     for n in worker_counts:
-        print(f"\n{'='*60}")
-        print(f"Benchmarking with {n} worker(s)...")
-        print(f"{'='*60}")
-
-        result = run_distributed_benchmark(
-            model_name=model_name,
-            model_path=model_path,
-            num_workers=n,
-            num_requests=num_requests,
-        )
-        all_results.append(result)
-
-        print(f"  Throughput: {result['throughput_qps']:.2f} QPS")
-        print(f"  p50 Latency: {result['p50_latency_ms']:.2f} ms")
-        print(f"  p95 Latency: {result['p95_latency_ms']:.2f} ms")
-
-    # Print scaling summary
-    if len(all_results) > 1:
-        baseline_qps = all_results[0]["throughput_qps"]
-        print(f"\n{'='*60}")
-        print("Scaling Summary")
-        print(f"{'='*60}")
-        for res, n in zip(all_results, worker_counts):
-            speedup = res["throughput_qps"] / baseline_qps if baseline_qps > 0 else 0
-            print(f"  {n} workers: {res['throughput_qps']:.2f} QPS "
-                  f"({speedup:.2f}x vs 1 worker)")
-
-    return all_results
+        print(f"Ray: {n} worker(s), batch {batch_size}, {len(frames)} frames")
+        results.append(run_distributed_benchmark(model_name, frames, n, batch_size, variant, device))
+    return results

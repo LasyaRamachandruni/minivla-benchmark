@@ -1,171 +1,103 @@
-"""Ray Serve deployment for VLA inference.
+"""Ray Serve HTTP endpoint for VLA inference with server-side request batching.
 
-Exposes the VLA model as an HTTP endpoint, enabling production-style
-serving with autoscaling, batching, and health checks.
+POST / with JSON:
+    {
+      "instruction": "put the bowl on the plate",
+      "state": [8 floats],
+      "images": {"observation.images.image": "<base64 PNG/JPEG>", "observation.images.image2": "..."},
+      "seed": 123            # optional: fixes the flow-matching noise
+    }
+Response: {"actions": [[...action_dim...] x chunk], "model": ..., "batch_size": ...}
 
-Usage:
-    python ray_workers/serve_endpoint.py --model mock --port 8000
-
-    # Query the endpoint:
-    curl -X POST http://localhost:8000/predict \\
-        -H "Content-Type: application/json" \\
-        -d '{"prompt": "pick up the red block"}'
+Requests missing the instruction, state or any camera the model needs get HTTP 400; the server
+never substitutes random inputs or outputs.
 """
 
-import os
-import sys
-import time
-import json
-import io
 import base64
-from typing import Optional
+import io
+import random
+from typing import List, Sequence
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from models.frames import Frame
 
 
-def create_serve_deployment(model_name: str = "mock", num_replicas: int = 1):
-    """Create a Ray Serve deployment for VLA inference."""
-    import ray
+def decode_image(b64: str) -> np.ndarray:
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+    return np.asarray(img, dtype=np.uint8)
+
+
+def encode_image(arr: np.ndarray) -> str:
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.fromarray(arr).save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def parse_request(body: dict, camera_keys: Sequence[str]) -> Frame:
+    if not isinstance(body, dict):
+        raise ValueError("body must be a JSON object")
+    task = body.get("instruction") or body.get("task")
+    if not task or not isinstance(task, str):
+        raise ValueError("missing 'instruction' (string)")
+    if "state" not in body:
+        raise ValueError("missing 'state' (list of floats)")
+    images = body.get("images") or {}
+    missing = [k for k in camera_keys if k not in images]
+    if missing:
+        raise ValueError(f"missing images for cameras {missing}")
+    return Frame(images={k: decode_image(images[k]) for k in camera_keys},
+                 state=np.asarray(body["state"], dtype=np.float32), task=task, source="request")
+
+
+def create_app(model_name: str = "mock", device: str = "cpu", num_replicas: int = 1, max_batch_size: int = 8):
     from ray import serve
+    from starlette.responses import JSONResponse
 
-    if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True)
-
-    @serve.deployment(
-        num_replicas=num_replicas,
-        ray_actor_options={"num_cpus": 1},
-    )
-    class VLAServeDeployment:
-        def __init__(self, model_name: str):
+    @serve.deployment(num_replicas=num_replicas,
+                      ray_actor_options={"num_cpus": 1, "num_gpus": 1 if device.startswith("cuda") else 0})
+    class VLADeployment:
+        def __init__(self):
             from models.load_model import load_model
-            self.model_info = load_model(model_name, device="cpu")
-            self.request_count = 0
-            self.total_latency_ms = 0.0
-            print(f"VLA Serve replica ready: {model_name} ({self.model_info.size_mb:.1f} MB)")
 
-        async def __call__(self, request) -> dict:
-            from models.load_model import create_sample_input
-            from pipeline.infer import run_inference
-            from PIL import Image
+            self.model = load_model(model_name, device=device)
 
-            body = await request.json()
-            prompt = body.get("prompt", "pick up the red block")
+        @serve.batch(max_batch_size=max_batch_size, batch_wait_timeout_s=0.01)
+        async def predict(self, items: List[tuple]) -> List[dict]:
+            frames = [f for f, _ in items]
+            seeds = [s for _, s in items]
+            actions = self.model.predict(frames, seeds, batch_size=len(frames))
+            return [{"actions": a.tolist(), "model": self.model.name, "batch_size": len(frames)} for a in actions]
 
-            # Decode base64 image if provided
-            image = None
-            if "image_base64" in body:
-                img_bytes = base64.b64decode(body["image_base64"])
-                image = Image.open(io.BytesIO(img_bytes))
+        async def __call__(self, request):
+            try:
+                body = await request.json()
+                frame = parse_request(body, self.model.camera_keys)
+            except ValueError as e:
+                return JSONResponse({"error": str(e)}, status_code=400)
+            seed = int(body["seed"]) if "seed" in body else random.getrandbits(31)
+            return await self.predict((frame, seed))
 
-            inputs = create_sample_input(
-                self.model_info.processor, self.model_info.device, image, prompt
-            )
-            result = run_inference(self.model_info, inputs)
-
-            self.request_count += 1
-            self.total_latency_ms += result["latency_ms"]
-
-            response = {
-                "latency_ms": result["latency_ms"],
-                "model": self.model_info.name,
-                "prompt": prompt,
-            }
-
-            if "actions" in result:
-                response["actions"] = result["actions"].tolist()
-            if "text" in result:
-                response["text"] = result["text"]
-            if "generated_ids" in result:
-                response["generated_ids"] = result["generated_ids"].tolist()
-
-            return response
-
-        async def health(self, request) -> dict:
-            return {
-                "status": "healthy",
-                "model": self.model_info.name,
-                "requests_served": self.request_count,
-                "avg_latency_ms": (
-                    self.total_latency_ms / self.request_count
-                    if self.request_count > 0 else 0
-                ),
-            }
-
-    app = VLAServeDeployment.bind(model_name)
-    return app
+    return VLADeployment.bind()
 
 
-def run_serve(model_name: str = "mock", port: int = 8000, num_replicas: int = 1):
-    """Start the Ray Serve endpoint."""
+def run_serve(model_name: str = "mock", device: str = "cpu", port: int = 8000, num_replicas: int = 1,
+              max_batch_size: int = 8):
+    import signal
+
     from ray import serve
 
-    app = create_serve_deployment(model_name, num_replicas)
-    serve.run(app, host="0.0.0.0", port=port)
+    from ray_workers import init_ray
 
-    print(f"\nVLA Serve endpoint running at http://localhost:{port}")
-    print(f"  POST /         - Run inference (body: {{\"prompt\": \"...\", \"image_base64\": \"...\"}})")
-    print(f"  Model: {model_name}, Replicas: {num_replicas}")
-    print("\nPress Ctrl+C to stop.")
-
+    init_ray()
+    serve.start(http_options={"host": "0.0.0.0", "port": port})
+    serve.run(create_app(model_name, device, num_replicas, max_batch_size))
+    print(f"Serving {model_name} on http://localhost:{port}/ ({num_replicas} replica(s), batch <= {max_batch_size})")
     try:
-        import signal
         signal.pause()
     except KeyboardInterrupt:
-        print("\nShutting down...")
         serve.shutdown()
-
-
-def benchmark_serve_endpoint(
-    url: str = "http://localhost:8000",
-    num_requests: int = 50,
-    concurrency: int = 4,
-    prompt: str = "pick up the red block",
-) -> dict:
-    """Benchmark a running Ray Serve endpoint with concurrent requests."""
-    import concurrent.futures
-    import urllib.request
-
-    def send_request(i):
-        payload = json.dumps({"prompt": prompt}).encode()
-        req = urllib.request.Request(
-            url, data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        start = time.perf_counter()
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            result = json.loads(resp.read())
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        return {"request_id": i, "total_ms": elapsed_ms, **result}
-
-    print(f"Benchmarking {url} with {num_requests} requests, concurrency={concurrency}")
-    wall_start = time.perf_counter()
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [executor.submit(send_request, i) for i in range(num_requests)]
-        results = [f.result() for f in concurrent.futures.as_completed(futures)]
-
-    wall_elapsed = time.perf_counter() - wall_start
-    latencies = np.array([r["total_ms"] for r in results])
-
-    return {
-        "num_requests": num_requests,
-        "concurrency": concurrency,
-        "wall_time_sec": wall_elapsed,
-        "throughput_qps": num_requests / wall_elapsed,
-        "p50_ms": float(np.percentile(latencies, 50)),
-        "p95_ms": float(np.percentile(latencies, 95)),
-        "p99_ms": float(np.percentile(latencies, 99)),
-    }
-
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="VLA Ray Serve Endpoint")
-    parser.add_argument("--model", default="mock", help="Model name")
-    parser.add_argument("--port", type=int, default=8000, help="Serve port")
-    parser.add_argument("--replicas", type=int, default=1, help="Number of replicas")
-    args = parser.parse_args()
-
-    run_serve(args.model, args.port, args.replicas)
