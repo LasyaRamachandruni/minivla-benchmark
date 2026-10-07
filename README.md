@@ -132,19 +132,16 @@ minivla-benchmark/
     └── run_full_pipeline.sh        # One-command full pipeline
 ```
 
-## SmolVLM-256M Results
+## Results
 
-| Configuration | Size (MB) | p50 Latency | Throughput (QPS) |
-|---|---|---|---|
-| Baseline PyTorch (MPS) | 489.2 | 5.9s | 0.17 |
-| INT8 Quantized (CPU) | 113.8 | 33.8s | 0.03 |
-| Pruned (MPS) | 489.2 | 5.2s | 0.19 |
-| Pruned + Quantized (CPU) | 113.8 | 15.7s | 0.06 |
+The SmolVLM-256M numbers that used to be here have been removed because they could not be reproduced as a fair comparison:
 
-**Key findings:**
-- Structured pruning gives 12% latency reduction on MPS
-- INT8 quantization achieves 77% model size reduction (489 → 114 MB)
-- Ray scaling requires distributed hardware for real throughput gains
+- the baseline ran on Apple MPS while the INT8 variants ran on CPU, so device and optimization were mixed together;
+- "pruning" only zeroed weights, so the model stayed 489 MB and any speedup was noise;
+- latencies came from 5 timed runs with no confidence intervals;
+- the inputs were random images, and SmolVLM produces text, not robot actions.
+
+New results will be added once the benchmark is rerun on a real VLA policy with real robot data.
 
 ## Tech Stack
 
