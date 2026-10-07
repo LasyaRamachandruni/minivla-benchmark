@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.egg-info/
 .DS_Store
-optimized/
-results/
-*.onnx
+.pytest_cache/
+# sampled LIBERO frames (hundreds of MB); results/ is committed
+data_cache/
+*.npz
