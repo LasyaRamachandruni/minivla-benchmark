@@ -1,67 +1,27 @@
 #!/usr/bin/env bash
-# MiniVLA Benchmark — Full Pipeline Runner
-# Runs all stages: benchmark, optimize, ray-bench, compare
+# Full benchmark: sample LIBERO frames once, run every variant on GPU (if present) and CPU,
+# then write results/RESULTS.md and one plot per results JSON.
+#
+#   ./scripts/run_full_pipeline.sh [model] [gpu_frames] [cpu_frames]
+#
+# Defaults: smolvla_libero, 500 frames on GPU, 50 frames on CPU (SmolVLA takes seconds per
+# sample on a 2-vCPU machine, so the CPU section uses a seeded subset of the same frames).
 set -euo pipefail
-
 cd "$(dirname "$0")/.."
 
-MODEL="${1:-mock}"
-N_BENCH="${2:-100}"
-N_RAY="${3:-200}"
-WORKERS="${4:-4}"
-RESULTS_DIR="results"
+MODEL="${1:-smolvla_libero}"
+GPU_FRAMES="${2:-500}"
+CPU_FRAMES="${3:-50}"
+CACHE="data_cache/libero_frames.npz"
 
-mkdir -p "$RESULTS_DIR"
+python cli.py sample-libero --num-frames "$GPU_FRAMES" --cache "$CACHE"
 
-echo "============================================"
-echo "MiniVLA Benchmark — Full Pipeline"
-echo "Model: $MODEL | Bench runs: $N_BENCH | Ray requests: $N_RAY | Workers: $WORKERS"
-echo "============================================"
+if python -c "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)"; then
+    python cli.py optimize --model "$MODEL" --device cuda --frames-cache "$CACHE" \
+        --num-frames "$GPU_FRAMES" --eval-batch-size 16 --N 100 --warmup 10
+fi
 
-# Stage 1: Single-device benchmark
-echo ""
-echo "[Stage 1] Single-device benchmark..."
-python3 cli.py benchmark \
-    --model "$MODEL" \
-    --N "$N_BENCH" \
-    --output "$RESULTS_DIR/stage1_baseline.csv"
+python cli.py optimize --model "$MODEL" --device cpu --frames-cache "$CACHE" \
+    --num-frames "$CPU_FRAMES" --eval-batch-size 1 --N 50 --warmup 5
 
-# Stage 2: Optimization pipeline
-echo ""
-echo "[Stage 2] Optimization pipeline..."
-python3 cli.py optimize \
-    --model "$MODEL" \
-    --quant-type int8 \
-    --prune-amount 0.3 \
-    --N "$((N_BENCH / 2))" \
-    --results-output "$RESULTS_DIR/stage2_optimized.csv"
-
-# Stage 3: Ray distributed benchmark
-echo ""
-echo "[Stage 3] Ray distributed benchmark..."
-python3 cli.py ray-bench \
-    --model "$MODEL" \
-    --workers "$WORKERS" \
-    --N "$N_RAY" \
-    --scaling-test \
-    --results-output "$RESULTS_DIR/stage3_ray.csv"
-
-# Stage 4: Combine and compare all results
-echo ""
-echo "[Stage 4] Combining results..."
-
-# Merge all CSVs (skip headers on subsequent files)
-head -1 "$RESULTS_DIR/stage1_baseline.csv" > "$RESULTS_DIR/results_table.csv"
-for f in "$RESULTS_DIR"/stage*.csv; do
-    tail -n +2 "$f" >> "$RESULTS_DIR/results_table.csv"
-done
-
-python3 cli.py compare \
-    --results "$RESULTS_DIR/results_table.csv" \
-    --plot \
-    --plot-output "$RESULTS_DIR/comparison.png"
-
-echo ""
-echo "============================================"
-echo "Pipeline complete! Results in $RESULTS_DIR/"
-echo "============================================"
+python cli.py compare --results "results/*.json" --markdown results/RESULTS.md
